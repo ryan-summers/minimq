@@ -1,4 +1,4 @@
-use minimq::mqtt_client::{consts, MqttClient, Property, QoS};
+use minimq::{consts, MqttClient, Property, QoS};
 
 use nb;
 use std::cell::RefCell;
@@ -147,7 +147,7 @@ fn main() -> std::io::Result<()> {
     let localhost = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let my_clock = Clock {};
     let mut client =
-        MqttClient::<_, consts::U256, _>::new(localhost, "IntegrationTest", stack, my_clock)
+        MqttClient::<consts::U256, _, _>::new(localhost, "IntegrationTest", stack, my_clock)
             .unwrap();
 
     let mut published = false;
@@ -180,14 +180,16 @@ fn main() -> std::io::Result<()> {
                 subscribed = true;
             }
         } else {
-            if client.subscriptions_pending() == false && !published {
-                println!("PUBLISH request");
-                let properties = [Property::ResponseTopic("response")];
-                client
-                    .publish("request", "Ping".as_bytes(), QoS::AtMostOnce, &properties)
-                    .unwrap();
+            if client.subscriptions_pending() == false {
+                if !published {
+                    println!("PUBLISH request");
+                    let properties = [Property::ResponseTopic("response")];
+                    client
+                        .publish("request", "Ping".as_bytes(), QoS::AtMostOnce, &properties)
+                        .unwrap();
 
-                published = true;
+                    published = true;
+                }
             }
         }
     }

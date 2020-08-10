@@ -1,33 +1,15 @@
-use crate::minimq::MessageType;
-use crate::mqtt_client::ProtocolError as Error;
-use crate::Property;
+use crate::{
+    message_types::MessageType,
+    mqtt_client::ProtocolError as Error,
+    Property, {debug, warn},
+};
 use bit_field::BitField;
-
 use generic_array::{ArrayLength, GenericArray};
-
 use heapless::{consts, Vec};
 
-const FIXED_HEADER_MAX: usize = 5; // type/flags + remaining length
-
-// TODO: Refactor to remove this.
-fn parse_variable_byte_integer(int: &[u8]) -> Option<(usize, usize)> {
-    let len = if int.len() >= 1 && (int[0] & 0b1000_0000) == 0 {
-        1
-    } else if int.len() >= 2 && (int[1] & 0b1000_0000) == 0 {
-        2
-    } else if int.len() >= 3 && (int[2] & 0b1000_0000) == 0 {
-        3
-    } else if int.len() >= 4 && (int[3] & 0b1000_0000) == 0 {
-        4
-    } else {
-        return None;
-    };
-    let mut acc = 0;
-    for i in 0..len {
-        acc += ((int[i] & 0b0111_1111) as usize) << i * 7;
-    }
-    Some((acc, len))
-}
+// The maximum size of the fixed header. This is calculated as the type+flag byte and the maximum
+// variable length integer size (4).
+const FIXED_HEADER_MAX: usize = 5;
 
 pub(crate) struct PacketReader<T: ArrayLength<u8>> {
     pub buffer: GenericArray<u8, T>,
@@ -100,18 +82,6 @@ where
         Ok(borrowed_data)
     }
 
-    pub fn skip(&self, bytes: usize) -> Result<(), Error> {
-        let mut index = self.index.borrow_mut();
-
-        if *index + bytes > self.buffer.len() {
-            return Err(Error::DataSize);
-        }
-
-        *index += bytes;
-
-        Ok(())
-    }
-
     pub fn len(&self) -> Result<usize, Error> {
         Ok(self.packet_length()? - *self.index.borrow())
     }
@@ -131,7 +101,7 @@ where
             }
         }
 
-        log::warn!("Encountered invalid variable integer");
+        warn!("Encountered invalid variable integer");
         Err(Error::MalformedInteger)
     }
 
@@ -202,11 +172,6 @@ where
         Ok(properties)
     }
 
-    pub fn message_type(&self) -> MessageType {
-        assert!(self.buffer.len() > 0);
-        MessageType::from(self.buffer[0].get_bits(4..7))
-    }
-
     pub fn packet_length(&self) -> Result<usize, Error> {
         if let Some(packet_length) = self.packet_length {
             Ok(packet_length)
@@ -224,7 +189,7 @@ where
 
     pub fn pop_packet(&mut self) -> Result<(), Error> {
         let packet_length = self.packet_length()?;
-        log::debug!("Popping packet of {} bytes", packet_length);
+        debug!("Popping packet of {} bytes", packet_length);
 
         let move_length = self.read_bytes - packet_length;
 
@@ -280,9 +245,30 @@ where
             return None;
         }
 
-        self.packet_length = match parse_variable_byte_integer(&self.buffer[1..self.read_bytes]) {
-            Some((rlen, nbytes)) => Some(1 + nbytes + rlen),
-            None => None,
+        // Attempt to parse a variable byte integer out of the currently available data.
+        self.packet_length = if let Some((rlen, nbytes)) = {
+            let int = &self.buffer[1..self.read_bytes];
+
+            let len = if int.len() >= 1 && (int[0] & 0b1000_0000) == 0 {
+                1
+            } else if int.len() >= 2 && (int[1] & 0b1000_0000) == 0 {
+                2
+            } else if int.len() >= 3 && (int[2] & 0b1000_0000) == 0 {
+                3
+            } else if int.len() >= 4 && (int[3] & 0b1000_0000) == 0 {
+                4
+            } else {
+                return None;
+            };
+            let mut acc = 0;
+            for i in 0..len {
+                acc += ((int[i] & 0b0111_1111) as usize) << i * 7;
+            }
+            Some((acc, len))
+        } {
+            Some(1 + rlen + nbytes)
+        } else {
+            None
         };
 
         self.packet_length

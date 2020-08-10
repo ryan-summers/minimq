@@ -1,52 +1,54 @@
-pub use crate::properties::Property;
 use crate::{
     de::{deserialize::ReceivedPacket, PacketReader},
     ser::serialize,
     session_state::SessionState,
+    Property, {debug, error, info},
 };
-use log::{debug, error, info};
 
-use embedded_nal::{Mode, SocketAddr};
+use core::cell::RefCell;
 
-pub use generic_array::typenum as consts;
-use generic_array::{ArrayLength, GenericArray};
-
+use embedded_nal::{IpAddr, Mode, SocketAddr};
 use embedded_time::{
     duration::{Fraction, Generic, Seconds},
     Instant,
 };
 
+use generic_array::{ArrayLength, GenericArray};
+use heapless::String;
 use nb;
 
-use core::cell::RefCell;
-pub use embedded_nal::{IpAddr, Ipv4Addr};
-
-use heapless::String;
-
-pub struct MqttClient<N, T, C>
+/// A client for interacting with an MQTT Broker.
+pub struct MqttClient<T, N, C>
 where
-    N: embedded_nal::TcpStack,
     T: ArrayLength<u8>,
+    N: embedded_nal::TcpStack,
     C: embedded_time::Clock,
 {
-    socket: RefCell<Option<N::TcpSocket>>,
+    /// The network stack originally provided to the client.
     pub network_stack: N,
     clock: C,
     last_transmit: RefCell<Instant<C>>,
-
+    socket: RefCell<Option<N::TcpSocket>>,
     state: RefCell<SessionState>,
     packet_reader: PacketReader<T>,
     transmit_buffer: RefCell<GenericArray<u8, T>>,
     connect_sent: bool,
 }
 
+/// The quality-of-service for an MQTT message.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum QoS {
+    /// A packet will be delivered at most once, but may not be delivered at all.
     AtMostOnce,
+
+    /// A packet will be delivered at least one time, but possibly more than once.
     AtLeastOnce,
+
+    /// A packet will be delivered exactly one time.
     ExactlyOne,
 }
 
+/// Possible errors encountered during an MQTT connection.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Error<E> {
     Network(E),
@@ -58,6 +60,7 @@ pub enum Error<E> {
     Protocol(ProtocolError),
 }
 
+/// Errors that are specific to the MQTT protocol implementation.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ProtocolError {
     Bounds,
@@ -79,12 +82,21 @@ impl<E> From<E> for Error<E> {
     }
 }
 
-impl<N, T, C> MqttClient<N, T, C>
+impl<T, N, C> MqttClient<T, N, C>
 where
-    N: embedded_nal::TcpStack,
     T: ArrayLength<u8>,
+    N: embedded_nal::TcpStack,
     C: embedded_time::Clock,
 {
+    /// Construct a new MQTT client.
+    ///
+    /// # Args
+    /// * `broker` - The IP address of the broker to connect to.
+    /// * `client_id` The client ID to use for communicating with the broker.
+    /// * `network_stack` - The network stack to use for communication.
+    ///
+    /// # Returns
+    /// An `MqttClient` that can be used for publishing messages and subscribing to topics.
     pub fn new<'a>(
         broker: IpAddr,
         client_id: &'a str,
@@ -146,12 +158,25 @@ where
         }
     }
 
+    /// Subscribe to a topic.
+    ///
+    /// # Note
+    /// A subscription is not maintained across a disconnection with the broker. In the case of MQTT
+    /// disconnections, topics will need to be subscribed to again.
+    ///
+    /// # Args
+    /// * `topic` - The topic to subscribe to.
+    /// * `properties` - A list of properties to attach to the subscription request. May be empty.
     pub fn subscribe<'a, 'b>(
         &self,
         topic: &'a str,
-        _properties: &[Property<'b>],
+        properties: &[Property<'b>],
     ) -> Result<(), Error<N::Error>> {
         let mut state = self.state.borrow_mut();
+
+        if !self.connect_sent {
+            return Err(Error::NotReady);
+        }
         let packet_id = state.get_packet_identifier();
 
         if !self.connect_sent {
@@ -159,7 +184,7 @@ where
         }
 
         let mut buffer = self.transmit_buffer.borrow_mut();
-        let packet = serialize::subscribe_message(&mut buffer, topic, packet_id, &[])
+        let packet = serialize::subscribe_message(&mut buffer, topic, packet_id, properties)
             .map_err(|e| Error::Protocol(e))?;
 
         match self.write(packet) {
@@ -176,10 +201,36 @@ where
         }
     }
 
+    /// Determine if any subscriptions are waiting for completion.
+    ///
+    /// # Returns
+    /// True if any subscriptions are waiting for confirmation from the broker.
     pub fn subscriptions_pending(&self) -> bool {
         self.state.borrow().pending_subscriptions.len() != 0
     }
 
+    /// Determine if the client has established a connection with the broker.
+    ///
+    /// # Returns
+    /// True if the client has sent a request to establish an MQTT connection.
+    pub fn is_connected(&self) -> bool {
+        self.connect_sent
+    }
+
+    /// Publish a message over MQTT.
+    ///
+    /// # Note
+    /// If the client is not yet connected to the broker, the message will be silently ignored.
+    ///
+    /// # Note
+    /// Currently, Only QoS level 1 (at most once) delivery is supported.
+    ///
+    /// # Args
+    /// * `topic` - The topic to publish the message to.
+    /// * `data` - The data to transmit as the message contents.
+    /// * `qos` - The desired quality-of-service level of the message. Must be QoS::AtMostOnce
+    /// * `properties` - A list of properties to associate with the message being published. May be
+    ///   empty.
     pub fn publish<'a, 'b>(
         &self,
         topic: &'a str,
@@ -190,8 +241,8 @@ where
         // TODO: QoS support.
         assert!(qos == QoS::AtMostOnce);
 
-        // If the socket is not connected, we can't do anything.
-        if self.socket_can_communicate()? == false {
+        // If we are not yet connected to the broker, we can't transmit a message.
+        if self.is_connected() == false {
             return Ok(());
         }
 
@@ -206,7 +257,7 @@ where
         self.write(packet)
     }
 
-    fn socket_can_communicate(&self) -> Result<bool, N::Error> {
+    fn socket_is_connected(&self) -> Result<bool, N::Error> {
         let mut socket_ref = self.socket.borrow_mut();
         let socket = socket_ref.take().unwrap();
 
@@ -238,6 +289,8 @@ where
             )],
         )
         .map_err(|e| Error::Protocol(e))?;
+
+        info!("Sending CONNECT");
         self.write(packet)?;
 
         self.connect_sent = true;
@@ -263,7 +316,6 @@ where
 
                 state.connected = true;
 
-                // TODO: Handle properties in the ConnAck.
                 for property in acknowledge.properties {
                     match property {
                         Property::MaximumPacketSize(size) => {
@@ -275,7 +327,7 @@ where
                         Property::ServerKeepAlive(keep_alive) => {
                             state.keep_alive_interval = keep_alive;
                         }
-                        prop => info!("Ignoring property: {:?}", prop),
+                        _prop => info!("Ignoring property: {:?}", _prop),
                     };
                 }
 
@@ -351,6 +403,11 @@ where
         Ok(())
     }
 
+    /// Check the MQTT interface for available messages.
+    ///
+    /// # Args
+    /// * `f` - A closure to process any received messages. The closure should accept the client,
+    /// topic, message, and list of proprties (in that order).
     pub fn poll<F>(&mut self, f: F) -> Result<Option<embedded_time::Instant<C>>, Error<N::Error>>
     where
         for<'a> F: Fn(&Self, &'a str, &[u8], &[Property<'a>]),
@@ -359,19 +416,22 @@ where
         let now = self.clock.try_now().unwrap();
 
         // If the socket is not connected, we can't do anything.
-        if self.socket_can_communicate()? == false {
+        if self.socket_is_connected()? == false {
+            let result = if self.connect_sent {
+                Err(Error::Disconnected)
+            } else {
+                // Request that the user poll in 1 second. The socket may be connected then.
+                let next_attempt = now.checked_add(Seconds(1)).unwrap();
+                Ok(Some(next_attempt))
+            };
+            self.reset()?;
             self.connect_socket()?;
-
-            // Request that the user poll in 1 second. The socket may be connected then.
-            let next_attempt = now.checked_add(Seconds(1)).unwrap();
-            return Ok(Some(next_attempt));
+            return result;
         }
 
-        // If we are not yet connected to the MQTT broker, we can't do anything.
-        if !self.state.borrow().connected {
-            if !self.connect_sent {
-                self.connect_to_broker()?;
-            }
+        // Connect to the MQTT broker.
+        if !self.connect_sent {
+            self.connect_to_broker()?;
         }
 
         // TODO: If the session timed out, inform the user.
@@ -437,9 +497,5 @@ where
         } else {
             Ok(None)
         }
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.connect_sent
     }
 }
