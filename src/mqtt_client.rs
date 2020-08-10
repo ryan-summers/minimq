@@ -11,6 +11,11 @@ use embedded_nal::{Mode, SocketAddr};
 pub use generic_array::typenum as consts;
 use generic_array::{ArrayLength, GenericArray};
 
+use embedded_time::{
+    duration::{Fraction, Generic, Seconds},
+    Instant,
+};
+
 use nb;
 
 use core::cell::RefCell;
@@ -18,13 +23,17 @@ pub use embedded_nal::{IpAddr, Ipv4Addr};
 
 use heapless::String;
 
-pub struct MqttClient<N, T>
+pub struct MqttClient<N, T, C>
 where
     N: embedded_nal::TcpStack,
     T: ArrayLength<u8>,
+    C: embedded_time::Clock,
 {
     socket: RefCell<Option<N::TcpSocket>>,
     pub network_stack: N,
+    clock: C,
+    last_transmit: RefCell<Instant<C>>,
+
     state: RefCell<SessionState>,
     packet_reader: PacketReader<T>,
     transmit_buffer: RefCell<GenericArray<u8, T>>,
@@ -70,21 +79,25 @@ impl<E> From<E> for Error<E> {
     }
 }
 
-impl<N, T> MqttClient<N, T>
+impl<N, T, C> MqttClient<N, T, C>
 where
     N: embedded_nal::TcpStack,
     T: ArrayLength<u8>,
+    C: embedded_time::Clock,
 {
     pub fn new<'a>(
         broker: IpAddr,
         client_id: &'a str,
         network_stack: N,
+        clock: C,
     ) -> Result<Self, Error<N::Error>> {
         // Connect to the broker's TCP port.
         let socket = network_stack.open(Mode::NonBlocking)?;
 
         // Next, connect to the broker over MQTT.
         let socket = network_stack.connect(socket, SocketAddr::new(broker, 1883))?;
+
+        let time = clock.try_now().unwrap();
 
         let mut client = MqttClient {
             network_stack: network_stack,
@@ -93,6 +106,8 @@ where
             transmit_buffer: RefCell::new(GenericArray::default()),
             packet_reader: PacketReader::new(),
             connect_sent: false,
+            clock,
+            last_transmit: RefCell::new(time),
         };
 
         client.reset()?;
@@ -103,7 +118,11 @@ where
     fn read(&self, mut buf: &mut [u8]) -> Result<usize, Error<N::Error>> {
         let mut socket_ref = self.socket.borrow_mut();
         let mut socket = socket_ref.take().unwrap();
-        let read = nb::block!(self.network_stack.read(&mut socket, &mut buf)).unwrap();
+        let read = match self.network_stack.read(&mut socket, &mut buf) {
+            Err(nb::Error::Other(e)) => return Err(Error::Network(e)),
+            Err(nb::Error::WouldBlock) => 0,
+            Ok(count) => count,
+        };
 
         // Put the socket back into the option.
         socket_ref.replace(socket);
@@ -122,6 +141,7 @@ where
         if written != buf.len() {
             Err(Error::WriteFail)
         } else {
+            *self.last_transmit.borrow_mut() = self.clock.try_now().unwrap();
             Ok(())
         }
     }
@@ -133,6 +153,10 @@ where
     ) -> Result<(), Error<N::Error>> {
         let mut state = self.state.borrow_mut();
         let packet_id = state.get_packet_identifier();
+
+        if !self.connect_sent {
+            return Err(Error::NotReady);
+        }
 
         let mut buffer = self.transmit_buffer.borrow_mut();
         let packet = serialize::subscribe_message(&mut buffer, topic, packet_id, &[])
@@ -279,6 +303,8 @@ where
                 Ok(())
             }
 
+            ReceivedPacket::PingResponse => Ok(()),
+
             ReceivedPacket::SubAck(subscribe_acknowledge) => {
                 match state
                     .pending_subscriptions
@@ -303,6 +329,12 @@ where
         }
     }
 
+    fn ping(&mut self) -> Result<(), Error<N::Error>> {
+        let mut buffer = self.transmit_buffer.borrow_mut();
+        let packet = serialize::ping_request(&mut buffer).map_err(|e| Error::Protocol(e))?;
+        self.write(packet)
+    }
+
     fn connect_socket(&mut self) -> Result<(), Error<N::Error>> {
         let mut socket_ref = self.socket.borrow_mut();
         let socket = socket_ref.take().unwrap();
@@ -319,16 +351,20 @@ where
         Ok(())
     }
 
-    pub fn poll<F>(&mut self, f: F) -> Result<(), Error<N::Error>>
+    pub fn poll<F>(&mut self, f: F) -> Result<Option<embedded_time::Instant<C>>, Error<N::Error>>
     where
         for<'a> F: Fn(&Self, &'a str, &[u8], &[Property<'a>]),
     {
         debug!("Polling MQTT interface");
+        let now = self.clock.try_now().unwrap();
 
         // If the socket is not connected, we can't do anything.
         if self.socket_can_communicate()? == false {
             self.connect_socket()?;
-            return Ok(());
+
+            // Request that the user poll in 1 second. The socket may be connected then.
+            let next_attempt = now.checked_add(Seconds(1)).unwrap();
+            return Ok(Some(next_attempt));
         }
 
         // If we are not yet connected to the MQTT broker, we can't do anything.
@@ -336,9 +372,9 @@ where
             if !self.connect_sent {
                 self.connect_to_broker()?;
             }
-
-            return Ok(());
         }
+
+        // TODO: If the session timed out, inform the user.
 
         let mut buf: [u8; 1024] = [0; 1024];
         let received = self.read(&mut buf)?;
@@ -373,6 +409,37 @@ where
             }
         }
 
-        Ok(())
+        // If it has been too long since the last transmission, send a ping request.
+        let prev = *self.last_transmit.borrow();
+        let now = self.clock.try_now().unwrap();
+
+        let duration = now.checked_duration_since(&prev).expect("Invalid duration");
+
+        // TODO: replace generic here with `Seconds` when possible.
+        if self.state.borrow().keep_alive_interval != 0 {
+            if duration
+                >= Generic::new(
+                    C::T::from(self.state.borrow().keep_alive_interval as u32),
+                    Fraction::new(1, 1),
+                )
+            {
+                info!("Ping");
+                self.ping()?;
+            }
+
+            let next_ping = self
+                .last_transmit
+                .borrow()
+                .checked_add(Seconds(self.state.borrow().keep_alive_interval as u32))
+                .unwrap();
+
+            Ok(Some(next_ping))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connect_sent
     }
 }

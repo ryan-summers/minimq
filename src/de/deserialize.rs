@@ -33,6 +33,7 @@ pub enum ReceivedPacket<'a> {
     ConnAck(ConnAck<'a>),
     Publish(Pub<'a>),
     SubAck(SubAck<'a>),
+    PingResponse,
 }
 
 impl<'a> ReceivedPacket<'a> {
@@ -64,6 +65,8 @@ impl<'a> ReceivedPacket<'a> {
 
                 Ok(ReceivedPacket::SubAck(parse_suback(packet_reader)?))
             }
+
+            MessageType::PingResp => Ok(ReceivedPacket::PingResponse),
 
             _ => Err(Error::UnsupportedPacket),
         }

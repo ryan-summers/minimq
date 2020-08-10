@@ -7,6 +7,22 @@ use std::net::{self, TcpStream};
 
 use embedded_nal::{self, IpAddr, Ipv4Addr, SocketAddr};
 
+struct Clock {}
+
+impl embedded_time::Clock for Clock {
+    type T = u64;
+
+    const SCALING_FACTOR: embedded_time::fraction::Fraction =
+        embedded_time::fraction::Fraction::new(1, 1);
+
+    fn try_now(&self) -> Result<embedded_time::Instant<Self>, embedded_time::clock::Error> {
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        Ok(embedded_time::Instant::new(time.as_secs()))
+    }
+}
+
 struct StandardStack {
     stream: RefCell<Option<TcpStream>>,
     mode: RefCell<embedded_nal::Mode>,
@@ -129,12 +145,13 @@ fn main() -> std::io::Result<()> {
 
     let stack = StandardStack::new();
     let localhost = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let my_clock = Clock {};
     let mut client =
-        MqttClient::<_, consts::U256>::new(localhost, "IntegrationTest", stack).unwrap();
+        MqttClient::<_, consts::U256, _>::new(localhost, "IntegrationTest", stack, my_clock)
+            .unwrap();
 
     let mut published = false;
-    client.subscribe("response", &[]).unwrap();
-    client.subscribe("request", &[]).unwrap();
+    let mut subscribed = false;
 
     loop {
         client
@@ -156,8 +173,14 @@ fn main() -> std::io::Result<()> {
             })
             .unwrap();
 
-        if client.subscriptions_pending() == false {
-            if !published {
+        if !subscribed {
+            if client.is_connected() {
+                client.subscribe("response", &[]).unwrap();
+                client.subscribe("request", &[]).unwrap();
+                subscribed = true;
+            }
+        } else {
+            if client.subscriptions_pending() == false && !published {
                 println!("PUBLISH request");
                 let properties = [Property::ResponseTopic("response")];
                 client

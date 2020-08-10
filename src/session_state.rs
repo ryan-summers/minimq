@@ -18,7 +18,7 @@ impl SessionState {
             broker,
             client_id: String::from(id),
             packet_id: 1,
-            keep_alive_interval: 0,
+            keep_alive_interval: 10,
             pending_subscriptions: Vec::new(),
             maximum_packet_size: None,
         }
@@ -27,7 +27,7 @@ impl SessionState {
     pub fn reset(&mut self) {
         self.connected = false;
         self.packet_id = 1;
-        self.keep_alive_interval = 0;
+        self.keep_alive_interval = 10;
         self.maximum_packet_size = None;
         self.pending_subscriptions.clear();
     }

@@ -17,6 +17,10 @@ pub fn integer_size(value: usize) -> usize {
     }
 }
 
+pub fn ping_request<'a>(dest: &'a mut [u8]) -> Result<&'a [u8], Error> {
+    ReversedPacketWriter::new(dest).finalize(MessageType::PingReq, 0)
+}
+
 pub fn connect_message<'a, 'b>(
     dest: &'b mut [u8],
     client_id: &[u8],
