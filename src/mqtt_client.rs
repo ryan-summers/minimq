@@ -114,6 +114,39 @@ where
         Ok(client)
     }
 
+    /// Get the current broker address.
+    pub fn get_broker(&self) -> IpAddr {
+        self.state.borrow().broker
+    }
+
+    /// Configure the current broker
+    ///
+    /// # Note
+    /// Any existing MQTT connection will be terminated.
+    ///
+    /// # Args
+    /// * `broker` - The new broker address to connect to.
+    pub fn set_broker(&mut self, broker: IpAddr) -> Result<(), Error<N::Error>> {
+        {
+            let mut socket_ref = self.socket.borrow_mut();
+            let socket = socket_ref.take().unwrap();
+
+            // Disconnect the socket and reconnect to the new broker.
+            self.network_stack.close(socket)?;
+            let socket = self.network_stack.open(Mode::NonBlocking)?;
+            let socket = self
+                .network_stack
+                .connect(socket, SocketAddr::new(broker, 1883))?;
+
+            // Put the socket back into the option.
+            socket_ref.replace(socket);
+        }
+        self.state.borrow_mut().broker = broker;
+        self.reset()?;
+
+        Ok(())
+    }
+
     fn read(&self, mut buf: &mut [u8]) -> Result<usize, Error<N::Error>> {
         let mut socket_ref = self.socket.borrow_mut();
         let mut socket = socket_ref.take().unwrap();
